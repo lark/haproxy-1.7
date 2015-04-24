@@ -600,6 +600,13 @@ endif
 endif
 endif
 
+ifneq ($(USE_SHADOWSOCKS),)
+BUILD_OPTIONS   += $(call ignore_implicit,USE_SHADOWSOCKS)
+OPTIONS_CFLAGS  += -DUSE_SHADOWSOCKS
+OPTIONS_LDFLAGS += $(if $(SSL_LIB),-L$(SSL_LIB)) -lssl -lcrypto
+OPTIONS_OBJS    += src/ss_sock.o
+endif
+
 ifneq ($(USE_LUA),)
 check_lua_lib = $(shell echo "int main(){}" | $(CC) -o /dev/null -x c - $(2) -l$(1) 2>/dev/null && echo $(1))
 check_lua_inc = $(shell if [ -d $(2)$(1) ]; then echo $(2)$(1); fi;)

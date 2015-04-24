@@ -29,6 +29,10 @@
 #include <openssl/ssl.h>
 #endif
 
+#ifdef USE_SHADOWSOCKS
+#include <openssl/ssl.h>
+#endif
+
 #include <common/config.h>
 #include <common/mini-clist.h>
 #include <eb32tree.h>
@@ -264,6 +268,18 @@ struct server {
 		char *client_crt;		/* client certificate to send */
 		struct sample_expr *sni;        /* sample expression for SNI */
 	} ssl_ctx;
+#endif
+#ifdef USE_SHADOWSOCKS
+	int use_shadowsocks;
+	struct {
+		int method;
+		int key_len;
+		int iv_len;
+		unsigned char key[EVP_MAX_KEY_LENGTH];
+		unsigned char *secret;
+		unsigned char *e_table;
+		unsigned char *d_table;
+	} ss_ctx;
 #endif
 	struct {
 		const char *file;		/* file where the section appears */
