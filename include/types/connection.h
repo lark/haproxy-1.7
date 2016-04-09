@@ -112,9 +112,10 @@ enum {
 	CO_FL_SSL_WAIT_HS   = 0x02000000,  /* wait for an SSL handshake to complete */
 	CO_FL_ACCEPT_PROXY  = 0x04000000,  /* receive a valid PROXY protocol header */
 	CO_FL_ACCEPT_CIP    = 0x08000000,  /* receive a valid NetScaler Client IP header */
+	CO_FL_SS_SEND_DEST  = 0x10000000,  /* wait for an SS handshake to complete */
 
 	/* below we have all handshake flags grouped into one */
-	CO_FL_HANDSHAKE     = CO_FL_SEND_PROXY | CO_FL_SSL_WAIT_HS | CO_FL_ACCEPT_PROXY | CO_FL_ACCEPT_CIP,
+	CO_FL_HANDSHAKE     = CO_FL_SEND_PROXY | CO_FL_SSL_WAIT_HS | CO_FL_ACCEPT_PROXY | CO_FL_ACCEPT_CIP | CO_FL_SS_SEND_DEST,
 
 	/* when any of these flags is set, polling is defined by socket-layer
 	 * operations, as opposed to data-layer. Transport is explicitly not
