@@ -37,28 +37,14 @@
 #include <common/debug.h>
 #include <common/errors.h>
 #include <common/standard.h>
-#include <common/ticks.h>
-#include <common/time.h>
-#include <common/cfgparse.h>
 
-#include <ebsttree.h>
-
-#include <types/global.h>
-#include <types/server.h>
-
-#include <proto/acl.h>
-#include <proto/arg.h>
 #include <proto/connection.h>
 #include <proto/fd.h>
-#include <proto/freq_ctr.h>
-#include <proto/frontend.h>
-#include <proto/listener.h>
-#include <proto/pattern.h>
 #include <proto/server.h>
 #include <proto/log.h>
 #include <proto/proxy.h>
-#include <proto/shctx.h>
-#include <proto/task.h>
+#include <proto/stream.h>
+#include <proto/stream_interface.h>
 
 #include <proto/ss_sock.h>
 
@@ -491,52 +477,8 @@ static int ss_sock_init(struct connection *conn)
 				goto out_error;
 		}
 
-		/* pseudo handshake: send destaddr to shadowsocks server */
-		if (!conn->xprt_st) {
-			struct session *sess;
-			struct connection *cli_conn;
-			char hdr_buf[32];
-			ssize_t len = 0;
-
-			sess = conn->owner;
-			cli_conn = objt_conn(sess->origin);
-
-			if (cli_conn)
-				conn_get_to_addr(cli_conn);
-			else
-				goto out_error;
-
-			if (cli_conn->addr.to.ss_family == AF_INET6) {
-				hdr_buf[len++] = 4;
-				memcpy(hdr_buf + len,
-				       &(((struct sockaddr_in6 *)&(cli_conn->addr.to))->sin6_addr),
-				       sizeof(struct in6_addr));
-				len += sizeof(struct in6_addr);
-				memcpy(hdr_buf + len,
-				       &(((struct sockaddr_in6 *)&(cli_conn->addr.to))->sin6_port),
-				       2);
-				len += 2;
-			} else {
-				hdr_buf[len++] = 1;
-				memcpy(hdr_buf + len,
-				       &(((struct sockaddr_in *)&(cli_conn->addr.to))->sin_addr),
-				       sizeof(struct in_addr));
-				len += sizeof(struct in_addr);
-				memcpy(hdr_buf + len,
-				       &(((struct sockaddr_in *)&(cli_conn->addr.to))->sin_port),
-				       2);
-				len += 2;
-			}
-			if (ss_sock_encrypt(sock_ctx, (uint8_t *)hdr_buf, len)) {
-				conn->err_code = CO_ER_SYS_MEMLIM;
-				goto out_error;
-			}
-			conn->xprt_st = 1;
-		}
-
 		/* start pseudo handshake */
 		conn->flags |= CO_FL_SS_SEND_DEST;
-		conn_data_want_send(conn);
 
 		return 0;
 
@@ -651,53 +593,6 @@ static int ss_sock_decrypt(struct ss_sock_ctx *sock_ctx, uint8_t *plain, ssize_t
 	return 0;
 }
 
-/*
- * send data in buffer
- * NOTE: after call, check conn->sock_ctx.end, if equals to conn->sock_ctx.buf,
- * all data is sent.
- */
-/* 0 = error
- * 1 = socket not ready
- * 2 = partial send
- * 3 = all send
- */
-#define REAL_SEND_ERROR    0
-#define REAL_SEND_NOTREADY 1
-#define REAL_SEND_PARTIAL  2
-#define REAL_SEND_COMPLETE 3
-static inline int real_send(struct connection *conn)
-{
-	ssize_t ret, try;
-	struct ss_sock_ctx *sock_ctx;
-
-	sock_ctx = (struct ss_sock_ctx *) conn->xprt_ctx;
-
-	try = sock_ctx->s.end - sock_ctx->s.pos;
-	if (try == 0)
-		goto finished;
-
-	ret = send(conn->t.sock.fd, sock_ctx->s.pos, try, 0);
-
-	if (ret == -1) {
-		if (errno == EAGAIN || errno == ENOTCONN) {
-			fd_cant_send(conn->t.sock.fd);
-			return 1;
-		} else {
-			conn->flags |= CO_FL_ERROR;
-			return 0;
-		}
-	}
-	if (ret < try) {
-		sock_ctx->s.pos += ret;
-		return 2;
-	}
-
-finished:
-	sock_ctx->s.pos = sock_ctx->s.end = sock_ctx->s.buf;
-
-	return 3;
-}
-
 static int ss_sock_from_buf(struct connection *conn, struct buffer *buf, int flags)
 {
 	ssize_t ret, try, done = 0;
@@ -714,13 +609,19 @@ static int ss_sock_from_buf(struct connection *conn, struct buffer *buf, int fla
 
 	sock_ctx = (struct ss_sock_ctx *) conn->xprt_ctx;
 
-	/* we may have data leftover from last try, try send */
-	ret = real_send(conn);
-	if (ret == REAL_SEND_ERROR)
-		goto out_error;
-	else if (ret == REAL_SEND_NOTREADY || ret == REAL_SEND_PARTIAL)
-		/* return 0 because no data consumed from buf */
-		return 0;
+	/* we may have data left over from last try. send first */
+	try = sock_ctx->s.end - sock_ctx->s.pos;
+	if (try) {
+		ret = conn_sock_send(conn, sock_ctx->s.pos, try, 0);
+		if (ret < 0)
+			goto out_error;
+
+		sock_ctx->s.pos += ret;
+		if (ret < try)
+			return ret;
+
+		sock_ctx->s.pos = sock_ctx->s.end = sock_ctx->s.buf;
+	}
 
 	/* we can send data now */
 	while (buf->o) {
@@ -734,12 +635,13 @@ static int ss_sock_from_buf(struct connection *conn, struct buffer *buf, int fla
 		done += try;
 		buf->o -= try;
 
-		ret = real_send(conn);
-		if (ret == REAL_SEND_ERROR)
+		ret = conn_sock_send(conn, sock_ctx->s.pos, try, 0);
+		if (ret < 0)
 			goto out_error;
-		else if (ret == REAL_SEND_NOTREADY || ret == REAL_SEND_PARTIAL)
-			return done;
-		/* send complete. try send more */
+
+		sock_ctx->s.pos += ret;
+		if (ret < try)
+			break;
 	}
 	return done;
 
@@ -812,6 +714,7 @@ out_error:
 
 int ss_sock_handshake(struct connection *conn, unsigned int flag)
 {
+	int try;
 	int ret;
 	struct ss_sock_ctx *sock_ctx;
 
@@ -823,37 +726,68 @@ int ss_sock_handshake(struct connection *conn, unsigned int flag)
 
 	sock_ctx = (struct ss_sock_ctx *) conn->xprt_ctx;
 
-	if ((sock_ctx->s.end - sock_ctx->s.pos)) {
-		ret = real_send(conn);
-		switch (ret) {
-		case REAL_SEND_ERROR:
+	if (!conn->xprt_st) {
+		struct stream_interface *si = conn->owner;
+		struct connection *cli_conn = objt_conn(si_opposite(si)->end);
+		char hdr_buf[32];
+		ssize_t len = 0;
+
+		conn_get_to_addr(cli_conn);
+
+		if (cli_conn->addr.to.ss_family == AF_INET6) {
+			hdr_buf[len++] = 4;
+			memcpy(hdr_buf + len,
+			       &(((struct sockaddr_in6 *)&(cli_conn->addr.to))->sin6_addr),
+			       sizeof(struct in6_addr));
+			len += sizeof(struct in6_addr);
+			memcpy(hdr_buf + len,
+			       &(((struct sockaddr_in6 *)&(cli_conn->addr.to))->sin6_port),
+			       2);
+			len += 2;
+		} else {
+			hdr_buf[len++] = 1;
+			memcpy(hdr_buf + len,
+			       &(((struct sockaddr_in *)&(cli_conn->addr.to))->sin_addr),
+			       sizeof(struct in_addr));
+			len += sizeof(struct in_addr);
+			memcpy(hdr_buf + len,
+			       &(((struct sockaddr_in *)&(cli_conn->addr.to))->sin_port),
+			       2);
+			len += 2;
+		}
+		if (ss_sock_encrypt(sock_ctx, (uint8_t *)hdr_buf, len)) {
+			conn->err_code = CO_ER_SYS_MEMLIM;
 			conn->flags |= CO_FL_ERROR;
 			return 0;
-		case REAL_SEND_NOTREADY:
-			/* not ready for write */
-			__conn_sock_stop_recv(conn);
-			__conn_sock_want_send(conn);
-			fd_cant_send(conn->t.sock.fd);
-			return 0;
-		case REAL_SEND_PARTIAL:
-			/* connection is ready, partial write */
-			if (conn->flags & CO_FL_WAIT_L4_CONN)
-				conn->flags &= ~CO_FL_WAIT_L4_CONN;
-			__conn_sock_stop_recv(conn);
-			__conn_sock_want_send(conn);
-			fd_cant_send(conn->t.sock.fd);
-			return 0;
-		case REAL_SEND_COMPLETE:
-			/* handshake complete, clear handshake flag */
-			__conn_sock_want_recv(conn);
-			__conn_sock_want_send(conn);
-			conn->flags &= ~flag;
-			return 1;
 		}
+		conn->xprt_st = 1;
 	}
 
-	fd_cant_send(conn->t.sock.fd);
-	return 0;
+	while ((try = sock_ctx->s.end - sock_ctx->s.pos) > 0) {
+		ret = conn_sock_send(conn, sock_ctx->s.pos, try, (conn->flags & CO_FL_DATA_WR_ENA) ? MSG_MORE : 0);
+		if (ret < 0) {
+			conn->flags |= CO_FL_ERROR;
+			return 0;
+		}
+
+		sock_ctx->s.pos += ret;
+
+		if (ret < try) {
+			__conn_sock_stop_recv(conn);
+			return 0;
+		}
+		/* SEND_DEST finished */
+		break;
+	}
+
+	__conn_sock_want_recv(conn);
+	__conn_sock_want_send(conn);
+
+	if (conn->flags & CO_FL_WAIT_L4_CONN)
+		conn->flags &= ~CO_FL_WAIT_L4_CONN;
+	conn->flags &= ~flag;
+
+	return 1;
 }
 
 static void ss_sock_close(struct connection *conn)
